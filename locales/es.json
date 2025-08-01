@@ -1,0 +1,14 @@
+{
+  "start": "👋 ¡Hola! Seleccione su idioma:",
+  "lang_selected": "Idioma establecido: Español",
+  "menu": "📌 Menú principal",
+  "enter_query": "Ingrese su consulta (por ejemplo: <code>dentista en Madrid</code>):",
+  "added_to_queue": "✅ Consulta «{query}» añadida a la cola",
+  "status_queue": "🕒 Estado: en cola",
+  "status_processing": "🔄 Estado: procesando",
+  "result_found": "📬 Encontrados {count} emails:\n{emails}",
+  "result_none": "📭 No se encontraron emails",
+  "error": "❌ Error: {error}",
+  "rate_limited": "⏳ Ha alcanzado el límite de solicitudes. Intente de nuevo en una hora.",
+  "no_results": "🔍 No se encontraron negocios para su consulta."
+}
