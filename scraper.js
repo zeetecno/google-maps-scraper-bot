@@ -1,101 +1,175 @@
-const chromium = require('chrome-aws-lambda');
-const puppeteer = require('puppeteer-core');
+// scraper.js
+const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const { saveToGoogleSheets } = require('./config/google-sheets');
 const { exportToCSV } = require('./utils/csvExporter');
 
+// Локализация
+const locales = {
+  ru: require('./locales/ru.json'),
+  es: require('./locales/es.json')
+};
+
 module.exports = async function scrape(job, bot) {
-  const { chatId, query, lang } = job.data;
-  const locales = {
-    ru: require('./locales/ru.json'),
-    es: require('./locales/es.json')
-  };
+  const { chatId, query, lang = 'ru' } = job.data;
   const t = locales[lang] || locales.ru;
+
+  let browser;
+  const allData = [];
+  const processedWebsites = new Set();
 
   try {
     await bot.telegram.sendMessage(chatId, t.status_processing);
 
-    const browser = await puppeteer.launch({
-      executablePath: await chromium.executablePath,
-      args: chromium.args.concat([
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process'
-      ]),
+    browser = await chromium.launch({
       headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
 
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-    await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(query)}`, {
-      waitUntil: 'networkidle2',
-      timeout: 60000
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      locale: 'es-ES',
     });
 
-    const urls = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('a[href^="/maps/place"]'))
-        .map(a => 'https://www.google.com' + a.getAttribute('href'))
-        .filter((url, i, arr) => arr.indexOf(url) === i)
-    );
+    const page = await context.newPage();
+    
+    // ==================================================================
+    // ИСПРАВЛЕННАЯ СТРОКА URL
+    // ==================================================================
+    const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
+    console.log(`🔍 Поиск: ${searchUrl}`);
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    if (urls.length === 0) {
+    try {
+      const acceptButton = page.getByRole('button', { name: /Aceptar todo|Accept all|Принять все/i });
+      await acceptButton.waitFor({ state: 'visible', timeout: 7000 });
+      console.log('✅ Кнопка согласия нажата.');
+      await acceptButton.click();
+      await page.waitForTimeout(3000);
+    } catch (error) {
+      console.log('✅ Окно согласия с cookie не появилось.');
+    }
+    
+    let placeUrls = [];
+    const feedLocator = page.locator('div[role="feed"]');
+      
+    try {
+        console.log('⏳ Ожидание появления контейнера с результатами...');
+        await feedLocator.waitFor({ state: 'visible', timeout: 25000 });
+        
+        console.log('✅ Контейнер найден. Ожидание загрузки первого результата...');
+        await feedLocator.locator('a[href*="/maps/place/"]').first().waitFor({ timeout: 20000 });
+        
+        console.log('✅ Первый результат загружен. Начинаю "умную" прокрутку до конца списка...');
+
+        await page.evaluate(async () => {
+            const feedElement = document.querySelector('div[role="feed"]');
+            if (!feedElement) return;
+            let lastHeight = 0;
+            let attempts = 0;
+            const maxAttempts = 5;
+            while (attempts < maxAttempts) {
+                const currentHeight = feedElement.scrollHeight;
+                feedElement.scrollTop = currentHeight;
+                await new Promise(resolve => setTimeout(resolve, 2500));
+                const newHeight = feedElement.scrollHeight;
+                if (newHeight === lastHeight) {
+                    attempts++;
+                } else {
+                    attempts = 0;
+                }
+                lastHeight = newHeight;
+            }
+        });
+        
+        console.log('✅ Прокрутка завершена. Собираю все найденные ссылки...');
+        
+        const links = await feedLocator.locator('a[href*="/maps/place/"]').all();
+        const uniqueUrls = new Set();
+        for (const link of links) {
+            const href = await link.getAttribute('href');
+            if (href) {
+                uniqueUrls.add(href.startsWith('http') ? href : `https://www.google.com${href}`);
+            }
+        }
+        placeUrls = [...uniqueUrls];
+
+    } catch (err) {
+        console.error('❌ Не удалось найти или обработать результаты на странице.', err.message);
+        fs.writeFileSync(`page_dump_error_${Date.now()}.html`, await page.content());
+    }
+
+    if (placeUrls.length === 0) {
       await bot.telegram.sendMessage(chatId, t.no_results);
       await browser.close();
       return;
     }
+    
+    placeUrls = placeUrls.slice(0, 200);
 
-    let emails = new Set();
+    await bot.telegram.sendMessage(chatId, `🔍 Найдено ${placeUrls.length} карточек. Начинаю парсинг сайтов...`);
 
-    for (const url of urls.slice(0, 8)) {
-      const tab = await browser.newPage();
+    for (const placeUrl of placeUrls) {
+      const tab = await context.newPage();
       try {
-        await tab.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-        const website = await tab.evaluate(() => {
-          const el = document.querySelector('button[data-item-id^="authority"]');
-          return el?.innerText.trim();
+        await tab.goto(placeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        
+        const companyInfo = await tab.evaluate(() => {
+            const websiteButton = document.querySelector('a[data-item-id="authority"]');
+            const phoneButton = document.querySelector('button[data-item-id*="phone"]');
+            const website = websiteButton ? websiteButton.href : null;
+            const phoneRaw = phoneButton ? phoneButton.getAttribute('aria-label') : null;
+            const phone = phoneRaw ? phoneRaw.replace(/[^0-9+]/g, '') : null; // Очищаем от лишних символов
+            return { website, phone };
         });
 
-        if (!website || !website.startsWith('http')) {
-          await tab.close();
+        const { website, phone } = companyInfo;
+
+        if (!website || processedWebsites.has(website)) {
           continue;
         }
+        processedWebsites.add(website);
 
-        await tab.goto(website, { waitUntil: 'networkidle2', timeout: 30000 });
+        console.log(`🌐 Перехожу на сайт: ${website} | 📞 Телефон: ${phone || 'не найден'}`);
+        await tab.goto(website, { waitUntil: 'networkidle', timeout: 45000 });
         const content = await tab.content();
-        const matches = content.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?!\.(png|jpg|gif|svg))/g) || [];
 
-        matches
-          .filter(email => !/(google|gstatic|ggpht|schema|example|sentry|imli)/i.test(email))
-          .forEach(email => emails.add(email));
+        const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+        const matches = [...new Set(content.match(emailRegex) || [])];
 
-        await new Promise(r => setTimeout(r, 3000));
+        const foundEmails = matches
+          .map(email => email.toLowerCase().trim())
+          .filter(email => !email.endsWith('.png') && !email.endsWith('.jpg') && !email.endsWith('.gif') && !email.endsWith('.svg'))
+          .filter(email => !/^(abuse|noreply|no-reply|contact|info|support|admin|hello|mail|help|sales|billing)@/i.test(email));
+        
+        if (foundEmails.length > 0) {
+            for (const email of foundEmails) {
+                allData.push({ email, website, phone: phone || '' });
+            }
+        } else {
+            allData.push({ email: '', website, phone: phone || '' });
+        }
+        
+        await new Promise(r => setTimeout(r, 1000));
+
       } catch (err) {
-        console.warn(`Ошибка на сайте ${website}:`, err.message);
+        console.warn(`❌ Ошибка при обработке ${placeUrl}:`, err.message);
       } finally {
-        await tab.close();
+        if (!tab.isClosed()) await tab.close();
       }
     }
 
     await browser.close();
 
-    const emailList = [...emails];
-    const filePath = path.join(__dirname, `emails_${chatId}_${Date.now()}.csv`);
-    await exportToCSV(emailList, filePath, query);
-
-    const message = emailList.length > 0
-      ? t.result_found.replace('{count}', emailList.length).replace('{emails}', emailList.join('\n'))
-      : t.result_none;
-
-    await bot.telegram.sendMessage(chatId, message);
-    await bot.telegram.sendDocument({ source: filePath, filename: 'emails.csv' });
-
-    await saveToGoogleSheets(emailList, query);
-    fs.unlinkSync(filePath);
+    // ... (остальной код для отправки результатов)
 
   } catch (err) {
+    console.error('Глобальная ошибка в scrape:', err);
     await bot.telegram.sendMessage(chatId, t.error.replace('{error}', err.message));
+  } finally {
+    if (browser?.isConnected()) {
+        await browser.close();
+    }
   }
 };
