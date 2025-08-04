@@ -151,7 +151,7 @@ module.exports = async function scrape(job, bot) {
             allData.push({ email: '', website, phone: phone || '' });
         }
         
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 3000));
 
       } catch (err) {
         console.warn(`❌ Ошибка при обработке ${placeUrl}:`, err.message);

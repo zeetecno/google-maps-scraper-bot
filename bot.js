@@ -3,6 +3,7 @@ const { addScrapingJob, startWorker } = require('./queue');
 const scraper = require('./scraper');
 const { isAllowed } = require('./utils/rateLimiter');
 const locales = require('./locales'); // ✅ Теперь работает
+const express = require('express');
 
 // === Настройки ===
 const ADMINS = [123456789]; // ← Замените на ваш Telegram ID
@@ -110,15 +111,43 @@ bot.on('text', async (ctx) => {
 // === Запуск воркера для обработки очереди ===
 startWorker(bot, scraper);
 
-// === Запуск бота ===
-bot.launch()
-  .then(() => {
-    console.log('🚀 Google Maps Scraper Bot успешно запущен!');
-  })
-  .catch(err => {
-    console.error('❌ Ошибка запуска бота:', err);
-  });
+// === Запуск бота 
+//bot.launch()
+ // .then(() => {
+//    console.log('🚀 Google Maps Scraper Bot успешно запущен!');
+//  })
+//  .catch(err => {
+//    console.error('❌ Ошибка запуска бота:', err);
+//  }); 
 
 // Корректное завершение
-process.on('SIGINT', () => bot.stop('SIGINT'));
-process.on('SIGTERM', () => bot.stop('SIGTERM'));
+//process.on('SIGINT', () => bot.stop('SIGINT'));
+//process.on('SIGTERM', () => bot.stop('SIGTERM'));
+
+// === Простой Express-сервер, чтобы Render видел активный порт
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get('/', (req, res) => {
+  res.send('🤖 Telegram Bot is running!');
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// Запускаем сервер
+app.listen(PORT, () => {
+  console.log(`✅ Веб-сервер запущен на порту ${PORT}`);
+});
+
+// === Запуск бота
+bot.launch().then(() => {
+  console.log('🚀 Telegram-бот запущен через long polling');
+});
+
+// Корректное завершение
+process.on('SIGINT', () => {
+  bot.stop('SIGINT');
+  process.exit(0);
+});
